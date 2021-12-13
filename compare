@@ -1,0 +1,142 @@
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.DataFrame
+import spark.implicits._
+import org.apache.spark.sql.functions._
+
+import org.apache.spark.sql.{DataFrame, Row, SparkSession}
+import org.apache.spark.sql.expressions.{UserDefinedFunction, Window}
+import scala.util.{Failure, Success, Try}
+
+
+// Method for Compare the schema
+def getSchemaDifference(df1: DataFrame,
+                        df2: DataFrame
+                       ): DataFrame = {
+  
+  //get the schema of the dataframes and make then in proper format
+  val schema1 = df1.schema.map { (structField: StructField) =>
+      structField.name.toLowerCase -> structField.dataType.toString
+    }.toMap
+  
+  val schema2 = df2.schema.map { (structField: StructField) =>
+      structField.name.toLowerCase -> structField.dataType.toString
+    }.toMap
+  
+  //find out the mismatches
+  val diff = (schema1.keys ++ schema2.keys).map(_.toLowerCase).toList.distinct.
+    flatMap { (columnName: String) =>
+      val schema1FieldOpt: Option[String] = schema1.get(columnName)
+      val schema2FieldOpt: Option[String] = schema2.get(columnName)
+
+      if (schema1FieldOpt == schema2FieldOpt) None
+      else Some(columnName -> (schema1FieldOpt, schema2FieldOpt))
+    }.toMap
+  
+  diff.map{
+    case(key, (Some(s1),Some(s2))) => (key,s1,s2)
+    case(key, (Some(s1),None)) => (key,s1,"")
+    case(key, (None,Some(s2))) => (key,"",s2)
+  }.toSeq.toDF("col_name","df1_datatype","df2_datatype")
+}
+
+
+
+case class ColumnProfile(colName: String, colCount: Long, nullCount: Long,
+                         distinctCount: Long, minColSize: String, maxColSize: String,
+                         minValue: String, maxValue: String,avgValue: String,totValue:String) {
+  override def toString: String = List(
+    colName
+    , colCount
+    , nullCount
+    , distinctCount
+    , minColSize
+    , maxColSize
+    , minValue
+    , maxValue
+    , avgValue
+    , totValue
+  ).mkString(";")
+}
+
+object ColumnProfile {
+
+  def isNumeric(col: String): Boolean = {
+    val isNum: Option[Float] = Try(col.toFloat).toOption
+    isNum.isDefined
+  }
+  val udfIsNumeric: UserDefinedFunction = udf[Boolean, String](isNumeric)
+
+  def ColumnFuncs(inCol:String,df:DataFrame): ColumnProfile = {
+    val colName = df.select(col(inCol))
+    val coltypelst = (colName.schema.map((x:StructField) => x.dataType.toString))
+    
+    colName.cache()
+    val colCount = colName.count()
+    val nullCounts = colName.filter(col(inCol).isNull or col(inCol) === "").count()
+    val distinctCount = colName.distinct().count()
+    val colSize = colName.withColumn("colLen",length(col(inCol))).cache()
+    val minSize = colSize.agg(min(col("colLen"))).drop(col(inCol)).collect()(0).getInt(0)
+    val maxSize = colSize.agg(max(col("colLen"))).drop(col(inCol)).collect()(0).getInt(0)
+    
+    val colVals = colName.withColumn("colValues",when(udfIsNumeric(col(inCol)),true)
+      .otherwise(false)).filter(col("colValues")===true).drop("colValues").cache()
+    
+    val minValue = Try(Try(colVals.agg(min(col(inCol))).drop(col(inCol)).collect()(0).get(0)).getOrElse(0).toString).getOrElse(0).toString
+    val maxValue = Try(Try(colVals.agg(max(col(inCol))).drop(col(inCol)).collect()(0).get(0)).getOrElse(0).toString).getOrElse(0).toString
+    val avgValue = Try(Try(colVals.agg(avg(col(inCol))).drop(col(inCol)).collect()(0).get(0)).getOrElse(0).toString).getOrElse(0).toString
+    val TotValue = Try(Try(colVals.agg(sum(col(inCol))).drop(col(inCol)).collect()(0).get(0)).getOrElse(0).toString).getOrElse(0).toString
+    
+    ColumnProfile(inCol,colCount,nullCounts,distinctCount,minSize.toString,maxSize.toString,minValue.toString,maxValue.toString,avgValue.toString,TotValue.toString)
+  }
+}
+
+def profile(df: org.apache.spark.sql.DataFrame) : DataFrame = {
+
+      df.cache
+      lazy val spark = SparkSession.builder().getOrCreate()
+
+      import spark.implicits._
+
+      
+      val profile : Seq[ColumnProfile] = Seq(
+        df.dtypes.filter(_._2 != "BooleanType").filter(!_._2.startsWith("ArrayType")).toSeq.map(col => ColumnProfile.ColumnFuncs(col._1,df))
+        //df.columns.toSeq.map(col => ColumnProfile.ColumnFuncs(col,df))
+      ).flatten
+
+      profile.toDF()
+    }
+
+def compare_data(df1:DataFrame, df2:DataFrame): DataFrame = {
+  
+  val oldcol = df1.columns
+  val newcol = df2.columns
+
+  val common_col = List(oldcol, newcol).reduce((a, b) => a intersect b)
+  
+  val olddf_common = df1.select(common_col.map(df1(_)) : _*)
+  val newdf_common = df2.select(common_col.map(df2(_)) : _*)
+  
+  
+  var profile1 = profile(olddf_common)
+  profile1 = profile1.toDF(profile1.columns.map(_.concat("_df1")): _*)
+
+  var profile2 = profile(newdf_common)
+  profile2 = profile2.toDF(profile2.columns.map(_.concat("_df2")): _*)
+
+  val output = profile1.join(profile2,profile1("colName_df1") === profile2("colName_df2"))
+
+  output.select($"colName_df1".alias("col_name"),$"totValue_df1",$"totValue_df2",($"totValue_df1"-$"totValue_df2").alias("totValue_diff"),$"avgValue_df1" , $"avgValue_df2" ,($"avgValue_df1" - $"avgValue_df2").alias("avgValue_diff"), $"colCount_df1" , $"colCount_df2",($"colCount_df1" - $"colCount_df2").alias("colCount_diff"),$"distinctCount_df1" , $"distinctCount_df2", ($"distinctCount_df1" - $"distinctCount_df2").alias("distinctCount_diff"), $"maxColSize_df1" , $"maxColSize_df2", $"maxValue_df1" , $"maxValue_df2", $"minColSize_df1" , $"minColSize_df2", $"minValue_df1" , $"minValue_df2", $"nullCount_df1" , $"nullCount_df2")
+}
+
+
+//unit test for schema comparison
+
+val df1 = Seq(
+  (1, "a", 100L, 10.0), (2, "b", 200L, 20.0)
+).toDF("c1", "c2", "c3", "c4")
+
+val df2 = Seq(
+  (1, "a", 100, 10.0f), (2, "b", 200, 20.0f)
+).toDF("c1", "c2", "c3", "c5")
+
+display(getSchemaDifference(df1,df2))
